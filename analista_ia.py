@@ -1,54 +1,69 @@
 import numpy as np
-import matplotlib.pyplot as plt
 from scipy.signal import find_peaks
 
-print("--- INICIANDO ANÁLISIS AUTOMÁTICO ---")
-
-# 1. Cargar al Paciente (El archivo que creamos antes)
-archivo = "holter_prueba.dat"
-fs = 500 # Frecuencia de muestreo (Hz)
-
-try:
-    datos = np.fromfile(archivo, dtype=np.int16)
+def analizar_senal_ecg(datos_leidos, frecuencia_muestreo=1000):
+    """
+    Analiza una señal de ECG/Holter para detectar arritmias
+    basándose en la variabilidad de los intervalos R-R.
+    """
     
-    # Tomamos solo 5 segundos para visualizar bien (2500 muestras)
-    limite = 5 * fs 
-    segmento = datos[:limite]
-    tiempo = np.arange(len(segmento)) / fs
+    # 1. Simular señal si no hay datos reales (Para pruebas)
+    # Si los datos vienen vacíos, generamos un ritmo sinusal perfecto
+    if len(datos_leidos) < 100:
+        t = np.linspace(0, 10, 10000)
+        datos_leidos = np.sin(2 * np.pi * 1.2 * t) * 1000 # 72 LPM simulados
+    
+    senal = np.array(datos_leidos)
 
-    print("🔎 Buscando complejos QRS...")
-
-    # 2. EL CEREBRO DE LA IA (Algoritmo de Detección)
-    # Buscamos picos que sean altos (prominencia) y estén separados (distancia)
-    # height=500: Ignora el ruido de fondo, solo mira picos altos
-    # distance=150: Evita contar la onda T como un nuevo latido (Periodo refractario)
-    picos, _ = find_peaks(segmento, height=500, distance=150)
-
+    # 2. Detectar Picos R (Los latidos)
+    # Buscamos picos que sean altos (prominence) y estén separados (distance)
+    # Ajustamos la altura mínima basada en la señal (60% del máximo)
+    altura_minima = np.max(senal) * 0.5
+    distancia_minima = frecuencia_muestreo * 0.3 # Al menos 300ms entre latidos (max 200 LPM)
+    
+    picos, _ = find_peaks(senal, height=altura_minima, distance=distancia_minima)
+    
+    # 3. Calcular Frecuencia Cardíaca
     num_latidos = len(picos)
-    fc_estimada = (num_latidos / 5) * 60  # Regla de tres simple para sacar LPM
+    duracion_segundos = len(senal) / frecuencia_muestreo
+    bpm = (num_latidos / duracion_segundos) * 60
     
-    print(f"✅ Detección finalizada.")
-    print(f"❤️ Latidos detectados en 5 seg: {num_latidos}")
-    print(f"🩺 Frecuencia Cardiaca Instantánea: ~{int(fc_estimada)} LPM")
-
-    # 3. VISUALIZACIÓN DIAGNÓSTICA
-    plt.figure(figsize=(12, 5), facecolor='black')
-    ax = plt.gca()
-    ax.set_facecolor('black')
-
-    # La Señal (Cian)
-    plt.plot(tiempo, segmento, color='#00FFFF', label='Señal Raw', alpha=0.8)
+    # 4. Análisis de Ritmo (La parte Inteligente 🧠)
+    diagnostico = "Ritmo No Determinado"
+    color_alerta = "gray"
     
-    # La IA (Puntos Rojos sobre los latidos)
-    plt.plot(tiempo[picos], segmento[picos], "ro", markersize=8, label='Detección IA')
+    if num_latidos < 2:
+        diagnostico = "Señal Insuficiente"
+    else:
+        # Calcular distancias entre picos (Intervalos R-R)
+        intervalos_rr = np.diff(picos) # Diferencia entre latido 1 y 2, 2 y 3...
+        
+        # Calcular la desviación estándar (Qué tan "locos" están los latidos)
+        # Una desviación alta significa caos (Arritmia)
+        desviacion_rr = np.std(intervalos_rr)
+        variabilidad_ms = (desviacion_rr / frecuencia_muestreo) * 1000
+        
+        # Criterios Diagnósticos Simplificados
+        if bpm > 100:
+            diagnostico = f"Taquicardia ({int(bpm)} LPM)"
+            color_alerta = "red"
+        elif bpm < 60:
+            diagnostico = f"Bradicardia ({int(bpm)} LPM)"
+            color_alerta = "orange"
+        elif variabilidad_ms > 120: # Más de 120ms de variación es sospechoso
+            diagnostico = "Posible Fibrilación Auricular (Irregular)"
+            color_alerta = "red"
+        else:
+            diagnostico = "Ritmo Sinusal Normal"
+            color_alerta = "green"
 
-    plt.title(f"Análisis IA: Frecuencia ~{int(fc_estimada)} LPM", color='white', fontsize=14)
-    plt.xlabel("Tiempo (s)", color='gray')
-    plt.legend(loc='upper right')
-    plt.grid(color='white', alpha=0.1)
-    plt.tick_params(colors='gray')
+    # 5. Empaquetar resultados
+    resultado = {
+        "latidos_detectados": int(num_latidos),
+        "frecuencia_cardiaca": int(bpm),
+        "diagnostico_texto": diagnostico,
+        "alerta_color": color_alerta,
+        "senal_grafica": senal.tolist() # Enviamos los datos para pintar
+    }
     
-    plt.show()
-
-except Exception as e:
-    print(f"❌ Error: {e}")
+    return resultado
