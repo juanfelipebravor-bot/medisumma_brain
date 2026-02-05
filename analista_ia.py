@@ -9,7 +9,7 @@ CORS(app)
 
 @app.route('/')
 def home():
-    return "Cerebro Electrofisiólogo MediSumma: ACTIVO v3.0 🫀"
+    return "Cerebro Electrofisiólogo V4 (P-Wave Detect) 🫀"
 
 @app.route('/analizar_holter', methods=['POST'])
 def analizar_holter():
@@ -22,93 +22,99 @@ def analizar_holter():
         filepath = f"/tmp/{filename}"
         file.save(filepath)
 
-        # 1. LECTURA DE SEÑAL
-        # Frecuencia de muestreo típica de Holter: 250 Hz
-        fs = 250.0 
+        # 1. LECTURA
+        fs = 250.0  # Hz
         raw_data = np.fromfile(filepath, dtype=np.int16)
-        
-        # Analizamos un tramo representativo (10 segundos = 2500 muestras)
-        # o toda la señal si es corta, para tener precisión estadística
-        window_size = 5000 
-        ecg_signal = raw_data[:window_size] if len(raw_data) > window_size else raw_data
+        # Analizar hasta 10 segundos
+        ecg_signal = raw_data[:5000] if len(raw_data) > 5000 else raw_data
 
-        # 2. DETECCIÓN DE COMPLEJOS QRS (Algoritmo de Pan-Tompkins simplificado)
-        # Usamos find_peaks con una distancia mínima para evitar contar onda T como R
-        # Distancia 150 muestras (aprox 600ms) evita doble conteo en ritmos normales
+        # 2. DETECCIÓN QRS
         distance = int(fs * 0.4) 
         height_threshold = np.max(ecg_signal) * 0.5
-        
         peaks, _ = signal.find_peaks(ecg_signal, height=height_threshold, distance=distance)
         
-        # 3. CÁLCULO DE INTERVALOS R-R
-        # Convertimos diferencias de índices a milisegundos
-        rr_intervals_samples = np.diff(peaks)
-        rr_intervals_ms = (rr_intervals_samples / fs) * 1000
+        # 3. ANÁLISIS R-R (Regularidad)
+        if len(peaks) < 2:
+            return jsonify({"diagnostico_texto": "TRAZADO INSUFICIENTE", "alerta_color": "grey", "frecuencia_cardiaca": 0, "senal_grafica": []})
 
-        # 4. ANÁLISIS ESTADÍSTICO (Criterios Médicos)
-        if len(rr_intervals_ms) < 2:
-            bpm = 0
-            cv_rr = 0
-        else:
-            mean_rr = np.mean(rr_intervals_ms)
-            std_rr = np.std(rr_intervals_ms)
-            bpm = int(60000 / mean_rr)
-            
-            # Coeficiente de Variación (CV): La medida clave para FA
-            # Si CV > 0.10-0.15, es altamente sugestivo de "Irregularmente Irregular"
-            cv_rr = std_rr / mean_rr
+        rr_intervals = np.diff(peaks)
+        mean_rr = np.mean(rr_intervals)
+        std_rr = np.std(rr_intervals)
+        bpm = int(60000 / (mean_rr / fs * 1000))
+        cv_rr = std_rr / mean_rr # Coeficiente de Variación
 
-        # 5. MOTOR DE DIAGNÓSTICO
-        diagnostico_texto = "Ritmo Sinusal Normal"
-        alerta_color = "green"
-
-        # Lógica de Diagnóstico
-        if bpm == 0:
-            diagnostico_texto = "SEÑAL INSUFICIENTE / ARTEFACTO"
-            alerta_color = "grey"
+        # 4. BUSQUEDA DE ONDA P (Nuevo Algoritmo) 🔎
+        # Miramos una ventana de 200ms ANTES del QRS (y dejamos 40ms de buffer para no confundir la subida R)
+        p_window = int(0.20 * fs) # 200ms
+        buffer_r = int(0.04 * fs)  # 40ms
         
-        elif cv_rr > 0.12: # Umbral de irregularidad (12% de variación)
-            # Es irregular. Ahora miramos la frecuencia para clasificar la FA
-            if bpm > 100:
-                diagnostico_texto = "FIBRILACIÓN AURICULAR (RVR)" # Respuesta Ventricular Rápida
-                alerta_color = "red"
-            elif bpm < 60:
-                diagnostico_texto = "FIBRILACIÓN AURICULAR (Respuesta Lenta)"
-                alerta_color = "orange"
+        p_waves_detected = 0
+        total_beats_checked = 0
+
+        for r_idx in peaks:
+            if r_idx > p_window: # Solo si hay espacio atrás
+                # Extraemos el segmento anterior al QRS
+                segmento_p = ecg_signal[r_idx - p_window : r_idx - buffer_r]
+                
+                # Criterio: ¿Hay algún pico en ese segmento que sea al menos 5-10% del tamaño del QRS?
+                # Y que no sea ruido plano
+                if len(segmento_p) > 0:
+                    pico_p = np.max(segmento_p) - np.min(segmento_p) # Amplitud local
+                    umbral_p = (np.max(ecg_signal) * 0.05) # 5% del voltaje máximo global
+                    
+                    if pico_p > umbral_p:
+                        p_waves_detected += 1
+                
+                total_beats_checked += 1
+        
+        # Ratio de Ondas P (Si aparece en más del 60% de latidos, asumimos que existe)
+        tiene_onda_p = (p_waves_detected / total_beats_checked > 0.6) if total_beats_checked > 0 else False
+
+        # 5. DIAGNÓSTICO INTEGRAL (Criterios AHA)
+        diagnostico = "Ritmo Sinusal Normal"
+        color = "green"
+        es_irregular = cv_rr > 0.15 # 15% de tolerancia
+
+        # --- ARBOL DE DECISIÓN MÉDICA ---
+        
+        if es_irregular:
+            # R-R Irregular
+            if not tiene_onda_p:
+                diagnostico = "FIBRILACIÓN AURICULAR"
+                color = "red"
             else:
-                diagnostico_texto = "FA - RESPUESTA VENTRICULAR CONTROLADA"
-                alerta_color = "orange"
-        
+                diagnostico = "ARRITMIA SINUSAL (P Presente)"
+                color = "green"
         else:
-            # Es regular. Miramos frecuencia.
-            if bpm > 100:
-                diagnostico_texto = "TAQUICARDIA SINUSAL"
-                alerta_color = "orange"
+            # R-R Regular
+            if bpm > 150 and not tiene_onda_p:
+                 diagnostico = "TAQUICARDIA SUPRAVENTRICULAR / FLUTTER 1:1"
+                 color = "red"
+            elif bpm > 100:
+                 diagnostico = "TAQUICARDIA SINUSAL" if tiene_onda_p else "TAQUICARDIA (Posible Reentrada)"
+                 color = "orange"
             elif bpm < 60:
-                diagnostico_texto = "BRADICARDIA SINUSAL"
-                alerta_color = "green"
-        
-        # Preparamos datos para gráfica (diezmado para velocidad)
-        senal_grafica = ecg_signal[::2].tolist() 
+                 diagnostico = "BRADICARDIA SINUSAL" if tiene_onda_p else "RITMO DE ESCAPE / JUNCTIONAL"
+                 color = "orange"
+            else:
+                 if not tiene_onda_p:
+                     diagnostico = "RITMO NODAL / AUSENCIA DE P"
+                     color = "orange"
+                 else:
+                     diagnostico = "RITMO SINUSAL NORMAL"
+                     color = "green"
 
-        # Limpieza
-        try:
-            os.remove(filepath)
-        except:
-            pass
-
-        print(f"Dx: {diagnostico_texto} | BPM: {bpm} | CV R-R: {cv_rr:.3f}")
+        senal_grafica = ecg_signal[::2].tolist()
 
         return jsonify({
             "frecuencia_cardiaca": bpm,
-            "diagnostico_texto": diagnostico_texto,
-            "alerta_color": alerta_color,
+            "diagnostico_texto": diagnostico,
+            "alerta_color": color,
             "senal_grafica": senal_grafica,
-            "rr_stats": f"Variabilidad RR: {(cv_rr*100):.1f}%" # Dato extra para el médico
+            "detalles": f"P-Wave: {'SI' if tiene_onda_p else 'NO'} | CV: {cv_rr:.2f}"
         })
 
     except Exception as e:
-        print(f"Error: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
