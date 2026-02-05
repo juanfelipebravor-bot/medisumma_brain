@@ -10,155 +10,166 @@ CORS(app)
 
 @app.route('/')
 def home():
-    return "Cerebro MediSumma: OIDOS (Holter) y OJOS (Vision) ACTIVOS v6.0 👁️🫀"
+    return "Cerebro MediSumma v7.0: OCR de Electrocardiograma ACTIVO 👁️📉"
 
-# --- MÓDULO 1: VISION ARTIFICIAL (NUEVO) ---
+# --- FUNCIÓN AUXILIAR 1: PROCESAMIENTO DE IMAGEN (OCR) ---
+def extraer_senal_imagen(path):
+    # 1. Leer imagen
+    img = cv2.imread(path)
+    if img is None: return []
+
+    # Redimensionar para estandarizar (ancho 1000px)
+    aspect_ratio = img.shape[0] / img.shape[1]
+    target_width = 1000
+    target_height = int(target_width * aspect_ratio)
+    img = cv2.resize(img, (target_width, target_height))
+
+    # 2. Escala de Grises y Umbralizado
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    
+    # Invertimos: Tinta negra se vuelve Blanca (255), Papel blanco se vuelve Negro (0)
+    # Usamos un umbral (90) para intentar ignorar la cuadrícula rosada clara
+    _, binary = cv2.threshold(gray, 90, 255, cv2.THRESH_BINARY_INV)
+
+    # 3. Escaneo Columna por Columna (Digitalización)
+    senal = []
+    height, width = binary.shape
+
+    for x in range(width):
+        col = binary[:, x]
+        # Buscamos índices donde hay "tinta" (píxeles blancos en negativo)
+        indices = np.where(col > 0)[0]
+        
+        if len(indices) > 0:
+            # Promedio de la posición Y de la tinta en esa columna
+            y_avg = np.mean(indices)
+            # Invertimos eje Y (en imagen 0 es arriba, en gráfica 0 es abajo)
+            val = height - y_avg
+            senal.append(val)
+        else:
+            # Si no hay tinta en esta columna (ruido o hueco), repetimos el último valor conocido
+            senal.append(senal[-1] if len(senal) > 0 else height/2)
+
+    # 4. Normalización (Centrar en 0)
+    senal = np.array(senal)
+    senal = senal - np.mean(senal)
+    
+    # 5. Amplificación (Ganancia visual para la app)
+    senal = senal * 5 
+    
+    return senal.tolist()
+
+# --- FUNCIÓN AUXILIAR 2: MOTOR DE DIAGNÓSTICO COMPARTIDO ---
+def motor_diagnostico(ecg_signal, fs):
+    # Detección QRS
+    distance = int(fs * 0.4) 
+    # Umbral adaptativo (40% del máximo)
+    height_threshold = np.max(ecg_signal) * 0.4 
+    peaks, _ = signal.find_peaks(ecg_signal, height=height_threshold, distance=distance)
+    
+    if len(peaks) < 2:
+        return 0, "TRAZADO NO LEÍBLE / RUIDO", "grey", 0, False
+
+    rr_intervals = np.diff(peaks)
+    mean_rr = np.mean(rr_intervals)
+    std_rr = np.std(rr_intervals)
+    bpm = int(60000 / (mean_rr / fs * 1000))
+    cv_rr = std_rr / mean_rr 
+
+    # Diagnóstico
+    diagnostico = "Ritmo Sinusal"
+    color = "green"
+    
+    if cv_rr > 0.15:
+        diagnostico = "POSIBLE FIBRILACIÓN AURICULAR (Irregular)"
+        color = "red"
+    else:
+        if bpm > 100:
+            diagnostico = "TAQUICARDIA"
+            color = "orange"
+        elif bpm < 60:
+            diagnostico = "BRADICARDIA"
+            color = "green"
+        else:
+            diagnostico = "RITMO SINUSAL NORMAL"
+            color = "green"
+            
+    return bpm, diagnostico, color, cv_rr, True
+
+# --- ENDPOINT 1: ANÁLISIS DE FOTO ---
 @app.route('/analizar_ecg_foto', methods=['POST'])
 def analizar_ecg_foto():
     try:
         if 'file' not in request.files:
-            return jsonify({"error": "No se envió imagen"}), 400
+            return jsonify({"error": "No file"}), 400
         
         file = request.files['file']
-        filename = file.filename
-        filepath = f"/tmp/{filename}"
+        filepath = f"/tmp/{file.filename}"
         file.save(filepath)
 
-        # 1. Leer la imagen con OpenCV
-        img = cv2.imread(filepath)
+        # 1. Extracción de señal (OCR)
+        senal_grafica = extraer_senal_imagen(filepath)
         
-        if img is None:
-            return jsonify({"error": "El archivo no es una imagen válida"}), 400
+        if len(senal_grafica) < 100:
+             return jsonify({
+                "status": "success",
+                "grid_detected": False,
+                "mensaje": "No se pudo extraer señal clara.",
+                "diagnostico_texto": "ERROR DE LECTURA",
+                "alerta_color": "grey",
+                "frecuencia_cardiaca": 0,
+                "senal_grafica": []
+            })
 
-        # 2. Pre-procesamiento: Detectar si es papel ECG (Busqueda de tonos Rojos/Rosados)
-        # Convertimos a formato HSV (Matiz, Saturación, Valor) para filtrar colores
-        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-
-        # Definir rango de color rosado/rojo (típico de la cuadrícula)
-        lower_red1 = np.array([0, 50, 50])
-        upper_red1 = np.array([10, 255, 255])
-        lower_red2 = np.array([170, 50, 50])
-        upper_red2 = np.array([180, 255, 255])
-
-        mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
-        mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
-        mask_grid = mask1 + mask2
-
-        # Contamos cuántos píxeles de "cuadrícula" encontramos
-        grid_pixels = cv2.countNonZero(mask_grid)
-        total_pixels = img.shape[0] * img.shape[1]
-        grid_ratio = grid_pixels / total_pixels
-
-        # 3. Lógica Inicial de Validación
-        calidad = "Imagen recibida correctamente"
-        papel_detectado = False
-
-        if grid_ratio > 0.01: # Si más del 1% es rojizo/rosado
-            calidad = "Papel Milimetrado Detectado. Calidad: Aceptable."
-            papel_detectado = True
-        else:
-            calidad = "ADVERTENCIA: No se detecta cuadrícula estándar. ¿Es una foto B/N?"
-
+        # 2. Análisis
+        # Estimamos FS heurística: 1000px ancho / ~3 segundos = 333 Hz
+        fs_estimada = 333.0 
+        
+        bpm, dx, color, cv, exito = motor_diagnostico(np.array(senal_grafica), fs_estimada)
+        
         # Limpieza
-        try:
-            os.remove(filepath)
-        except:
-            pass
+        try: os.remove(filepath)
+        except: pass
 
-        # Por ahora, devolvemos el análisis técnico de la imagen
         return jsonify({
             "status": "success",
-            "mensaje": calidad,
-            "grid_detected": papel_detectado,
-            "dimensiones": f"{img.shape[1]}x{img.shape[0]} px",
-            "diagnostico_preliminar": "Módulo de Digitalización listo para extracción de señal."
+            "grid_detected": True,
+            "mensaje": "Digitalización Completada",
+            "senal_grafica": senal_grafica, # La señal extraída
+            "frecuencia_cardiaca": bpm,
+            "diagnostico_texto": dx,
+            "alerta_color": color,
+            "detalles": f"Fuente: CÁMARA | CV: {cv:.2f}"
         })
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-
-# --- MÓDULO 2: HOLTER DIGITAL (YA CALIBRADO) ---
+# --- ENDPOINT 2: ANÁLISIS DE HOLTER (.DAT) ---
 @app.route('/analizar_holter', methods=['POST'])
 def analizar_holter():
     try:
-        if 'file' not in request.files:
-            return jsonify({"error": "No se envió archivo"}), 400
-        
+        if 'file' not in request.files: return jsonify({"error": "No file"}), 400
         file = request.files['file']
-        filename = file.filename
-        filepath = f"/tmp/{filename}"
+        filepath = f"/tmp/{file.filename}"
         file.save(filepath)
-
-        fs = 500.0 
+        
         raw_data = np.fromfile(filepath, dtype=np.int16)
+        # Limitamos a 5000 muestras para análisis rápido
         ecg_signal = raw_data[:5000] if len(raw_data) > 5000 else raw_data
-
-        distance = int(fs * 0.4) 
-        height_threshold = np.max(ecg_signal) * 0.5
-        peaks, _ = signal.find_peaks(ecg_signal, height=height_threshold, distance=distance)
         
-        if len(peaks) < 2:
-            return jsonify({"diagnostico_texto": "TRAZADO INSUFICIENTE", "alerta_color": "grey", "frecuencia_cardiaca": 0, "senal_grafica": []})
-
-        rr_intervals = np.diff(peaks)
-        mean_rr = np.mean(rr_intervals)
-        std_rr = np.std(rr_intervals)
-        bpm = int(60000 / (mean_rr / fs * 1000))
-        cv_rr = std_rr / mean_rr 
-
-        p_window = int(0.20 * fs) 
-        buffer_r = int(0.04 * fs)
-        p_waves_detected = 0
-        total_beats_checked = 0
-
-        for r_idx in peaks:
-            if r_idx > p_window:
-                segmento_p = ecg_signal[r_idx - p_window : r_idx - buffer_r]
-                if len(segmento_p) > 0:
-                    pico_p = np.max(segmento_p) - np.min(segmento_p)
-                    umbral_p = (np.max(ecg_signal) * 0.03) 
-                    if pico_p > umbral_p:
-                        p_waves_detected += 1
-                total_beats_checked += 1
+        bpm, dx, color, cv, exito = motor_diagnostico(ecg_signal, 500.0) # FS 500Hz
         
-        tiene_onda_p = (p_waves_detected / total_beats_checked > 0.5) if total_beats_checked > 0 else False
-
-        diagnostico = "Ritmo Sinusal Normal"
-        color = "green"
-        es_irregular = cv_rr > 0.15 
-
-        if es_irregular:
-            if not tiene_onda_p:
-                diagnostico = "FIBRILACIÓN AURICULAR"
-                color = "red"
-            else:
-                diagnostico = "ARRITMIA SINUSAL"
-                color = "green"
-        else:
-            if bpm > 150 and not tiene_onda_p:
-                 diagnostico = "TAQUICARDIA SUPRAVENTRICULAR"
-                 color = "red"
-            elif bpm > 100:
-                 diagnostico = "TAQUICARDIA SINUSAL" if tiene_onda_p else "TAQUICARDIA (Posible Reentrada)"
-                 color = "orange"
-            elif bpm < 60:
-                 diagnostico = "BRADICARDIA SINUSAL"
-                 color = "green"
-            else:
-                 diagnostico = "RITMO SINUSAL NORMAL" if tiene_onda_p else "RITMO DE LA UNIÓN"
-                 color = "green"
-
-        senal_grafica = ecg_signal.tolist()
+        try: os.remove(filepath)
+        except: pass
 
         return jsonify({
             "frecuencia_cardiaca": bpm,
-            "diagnostico_texto": diagnostico,
+            "diagnostico_texto": dx,
             "alerta_color": color,
-            "senal_grafica": senal_grafica,
-            "detalles": f"P-Wave: {'SI' if tiene_onda_p else 'NO'} | CV: {cv_rr:.2f}"
+            "senal_grafica": ecg_signal.tolist(),
+            "detalles": f"Fuente: HOLTER DIGITAL | CV: {cv:.2f}"
         })
-
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
