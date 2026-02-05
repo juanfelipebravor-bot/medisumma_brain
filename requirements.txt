@@ -4,4 +4,4 @@ numpy
 gunicorn
 scipy
 opencv-python-headless
-Pillow
+Pillow 
