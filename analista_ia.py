@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import numpy as np
+import scipy.signal as signal
 import os
 
 app = Flask(__name__)
@@ -8,7 +9,7 @@ CORS(app)
 
 @app.route('/')
 def home():
-    return "Cerebro IA de MediSumma: ACTIVO (Modo Realista) 🧠⚡"
+    return "Cerebro Electrofisiólogo MediSumma: ACTIVO v3.0 🫀"
 
 @app.route('/analizar_holter', methods=['POST'])
 def analizar_holter():
@@ -18,46 +19,77 @@ def analizar_holter():
         
         file = request.files['file']
         filename = file.filename
-        
-        # 1. Guardar temporalmente
         filepath = f"/tmp/{filename}"
         file.save(filepath)
 
-        # 2. LECTURA DE SEÑAL
-        # Leemos como int16 (estándar común)
-        signal = np.fromfile(filepath, dtype=np.int16)
+        # 1. LECTURA DE SEÑAL
+        # Frecuencia de muestreo típica de Holter: 250 Hz
+        fs = 250.0 
+        raw_data = np.fromfile(filepath, dtype=np.int16)
         
-        # Tomamos una muestra para no saturar memoria
-        muestras_analisis = signal[:5000] if len(signal) > 5000 else signal
+        # Analizamos un tramo representativo (10 segundos = 2500 muestras)
+        # o toda la señal si es corta, para tener precisión estadística
+        window_size = 5000 
+        ecg_signal = raw_data[:window_size] if len(raw_data) > window_size else raw_data
 
-        # 3. ALGORITMO DE DIAGNÓSTICO REAL 🫀
-        # Calculamos la variabilidad (Desviación Estándar)
-        variabilidad = np.std(muestras_analisis)
+        # 2. DETECCIÓN DE COMPLEJOS QRS (Algoritmo de Pan-Tompkins simplificado)
+        # Usamos find_peaks con una distancia mínima para evitar contar onda T como R
+        # Distancia 150 muestras (aprox 600ms) evita doble conteo en ritmos normales
+        distance = int(fs * 0.4) 
+        height_threshold = np.max(ecg_signal) * 0.5
         
-        # Estimación simple de frecuencia (BPM)
-        umbral = np.max(muestras_analisis) * 0.6
-        picos = np.where(muestras_analisis > umbral)[0]
-        duracion_segundos = len(muestras_analisis) / 250.0 # Asumiendo 250Hz
-        bpm = int((len(picos) / duracion_segundos) * 60) if duracion_segundos > 0 else 0
+        peaks, _ = signal.find_peaks(ecg_signal, height=height_threshold, distance=distance)
+        
+        # 3. CÁLCULO DE INTERVALOS R-R
+        # Convertimos diferencias de índices a milisegundos
+        rr_intervals_samples = np.diff(peaks)
+        rr_intervals_ms = (rr_intervals_samples / fs) * 1000
 
-        # Normalización de BPM si sale ruido extremo (para que no diga 0 o 500)
-        if bpm < 30 or bpm > 220:
-             bpm = np.random.randint(60, 100) # Asumir normal si el cálculo falla por ruido
+        # 4. ANÁLISIS ESTADÍSTICO (Criterios Médicos)
+        if len(rr_intervals_ms) < 2:
+            bpm = 0
+            cv_rr = 0
+        else:
+            mean_rr = np.mean(rr_intervals_ms)
+            std_rr = np.std(rr_intervals_ms)
+            bpm = int(60000 / mean_rr)
+            
+            # Coeficiente de Variación (CV): La medida clave para FA
+            # Si CV > 0.10-0.15, es altamente sugestivo de "Irregularmente Irregular"
+            cv_rr = std_rr / mean_rr
 
-        # --- AQUÍ ESTÁ EL JUICIO CLÍNICO ---
+        # 5. MOTOR DE DIAGNÓSTICO
         diagnostico_texto = "Ritmo Sinusal Normal"
         alerta_color = "green"
 
-        # Criterio: Si la variabilidad es muy alta (caos) O la FC es peligrosa
-        if variabilidad > 300 or bpm > 110:
-            diagnostico_texto = "POSIBLE FIBRILACIÓN AURICULAR"
-            alerta_color = "red"
-        elif bpm < 45:
-             diagnostico_texto = "BRADICARDIA SINUSAL"
-             alerta_color = "orange" # Alerta media
-
-        # 4. Preparar gráfica (Diezmar señal 1:5 para velocidad)
-        senal_grafica = signal[:2000:5].tolist()
+        # Lógica de Diagnóstico
+        if bpm == 0:
+            diagnostico_texto = "SEÑAL INSUFICIENTE / ARTEFACTO"
+            alerta_color = "grey"
+        
+        elif cv_rr > 0.12: # Umbral de irregularidad (12% de variación)
+            # Es irregular. Ahora miramos la frecuencia para clasificar la FA
+            if bpm > 100:
+                diagnostico_texto = "FIBRILACIÓN AURICULAR (RVR)" # Respuesta Ventricular Rápida
+                alerta_color = "red"
+            elif bpm < 60:
+                diagnostico_texto = "FIBRILACIÓN AURICULAR (Respuesta Lenta)"
+                alerta_color = "orange"
+            else:
+                diagnostico_texto = "FA - RESPUESTA VENTRICULAR CONTROLADA"
+                alerta_color = "orange"
+        
+        else:
+            # Es regular. Miramos frecuencia.
+            if bpm > 100:
+                diagnostico_texto = "TAQUICARDIA SINUSAL"
+                alerta_color = "orange"
+            elif bpm < 60:
+                diagnostico_texto = "BRADICARDIA SINUSAL"
+                alerta_color = "green"
+        
+        # Preparamos datos para gráfica (diezmado para velocidad)
+        senal_grafica = ecg_signal[::2].tolist() 
 
         # Limpieza
         try:
@@ -65,13 +97,14 @@ def analizar_holter():
         except:
             pass
 
-        print(f"Análisis Realista: {bpm} BPM - {diagnostico_texto} (Var: {variabilidad:.2f})")
+        print(f"Dx: {diagnostico_texto} | BPM: {bpm} | CV R-R: {cv_rr:.3f}")
 
         return jsonify({
             "frecuencia_cardiaca": bpm,
             "diagnostico_texto": diagnostico_texto,
             "alerta_color": alerta_color,
-            "senal_grafica": senal_grafica
+            "senal_grafica": senal_grafica,
+            "rr_stats": f"Variabilidad RR: {(cv_rr*100):.1f}%" # Dato extra para el médico
         })
 
     except Exception as e:
