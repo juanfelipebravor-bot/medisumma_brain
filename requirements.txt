@@ -1,5 +1,4 @@
-fastapi
-uvicorn
+Flask
+flask-cors
 numpy
-scipy
-python-multipart
+gunicorn
