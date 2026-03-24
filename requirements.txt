@@ -6,3 +6,4 @@ scipy
 opencv-python-headless
 Pillow
 gunicorn
+httpx

@@ -987,6 +987,57 @@ async def analizar_ecg_foto(file: UploadFile = File(...)):
     }
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# CHAT IA — Endpoint de consulta médica (API Key server-side)
+# ─────────────────────────────────────────────────────────────────────────────
+
+import os
+import httpx
+from pydantic import BaseModel
+
+class ChatRequest(BaseModel):
+    messages: list
+    system: str = ""
+
+@app.post("/chat")
+async def chat_medico(req: ChatRequest):
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        return {"reply": "El servicio de chat IA no está activo en este servidor. Configura ANTHROPIC_API_KEY en Render."}
+
+    system = req.system or (
+        "Eres HealthDocz AI, asistente médico educativo especializado en cardiología, "
+        "interpretación de ECG y medicina interna. Basas tus respuestas en guías AHA, ESC "
+        "y evidencia actualizada. Siempre recuerdas que no reemplazas la consulta médica presencial. "
+        "Respondes en español de manera concisa, estructurada y clara."
+    )
+
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "Content-Type": "application/json",
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                },
+                json={
+                    "model": "claude-haiku-4-5-20251001",
+                    "max_tokens": 1024,
+                    "system": system,
+                    "messages": req.messages,
+                },
+                timeout=30.0,
+            )
+        if resp.status_code == 200:
+            data = resp.json()
+            return {"reply": data["content"][0]["text"]}
+        else:
+            return {"reply": f"Error del servicio IA ({resp.status_code}). Intenta de nuevo."}
+    except Exception as e:
+        return {"reply": f"Error de conexión al servicio IA: {str(e)}"}
+
+
 def _error(msg: str) -> dict:
     return {
         "calidad_imagen":             f"Error — {msg}",
